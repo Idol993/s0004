@@ -1,0 +1,84 @@
+system:
+  name: "MultiAgentLLMTrainer"
+  version: "1.0.0"
+  max_overhead_ratio: 0.15
+  device: "cuda"
+  seed: 42
+
+communication:
+  protocol: "CentralMessageBus"
+  message_timeout: 30.0
+  max_queue_size: 1000
+  enable_message_logging: true
+  compression_enabled: true
+
+agents:
+  planner:
+    name: "planner"
+    role: "task_decomposition"
+    model_name: "gpt2-medium"
+    learning_rate: 1e-5
+    frozen: false
+    checkpoint_dir: "./checkpoints/planner"
+  executor:
+    name: "executor"
+    role: "action_execution"
+    model_name: "gpt2-medium"
+    learning_rate: 1e-5
+    frozen: false
+    checkpoint_dir: "./checkpoints/executor"
+  evaluator:
+    name: "evaluator"
+    role: "performance_evaluation"
+    model_name: "gpt2-medium"
+    learning_rate: 1e-5
+    frozen: false
+    checkpoint_dir: "./checkpoints/evaluator"
+  memory:
+    name: "memory"
+    role: "experience_storage"
+    model_name: "gpt2-medium"
+    learning_rate: 1e-5
+    frozen: false
+    checkpoint_dir: "./checkpoints/memory"
+  reflector:
+    name: "reflector"
+    role: "error_analysis"
+    model_name: "gpt2-medium"
+    learning_rate: 1e-5
+    frozen: false
+    checkpoint_dir: "./checkpoints/reflector"
+
+responsibility_inference:
+  counterfactual_baseline:
+    num_samples: 5
+    baseline_type: "random"
+    shapley_enabled: true
+  mdp_credit_assignment:
+    gamma: 0.99
+    lambda_gae: 0.95
+    hidden_dim: 256
+    num_layers: 2
+    learning_rate: 1e-4
+  responsibility_threshold: 0.3
+  max_responsible_agents: 3
+
+rollback:
+  enabled: true
+  retain_best_checkpoint: true
+  min_improvement_threshold: 0.01
+  max_retries: 3
+
+training:
+  max_episodes: 1000
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  max_grad_norm: 1.0
+  warmup_steps: 100
+  save_interval: 10
+  eval_interval: 5
+
+logging:
+  level: "INFO"
+  log_dir: "./logs"
+  tensorboard_enabled: true
