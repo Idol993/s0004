@@ -20,7 +20,7 @@ class PlannerAgent(BaseAgent):
         log_dir: str = "./logs",
     ):
         if llm_config is None:
-            llm_config = LLMConfig(model_name="gpt2-medium")
+            llm_config = LLMConfig(model_name="gpt2")
         super().__init__(
             agent_id=agent_id,
             role=AgentRole.PLANNER,
@@ -100,7 +100,8 @@ class PlannerAgent(BaseAgent):
     def _parse_plan(self, plan_text: str) -> List[Dict[str, Any]]:
         lines = [l.strip() for l in plan_text.split("\n") if l.strip()]
         sub_tasks = []
-        for i, line in enumerate(lines[:10]):
+        max_subtasks = 3
+        for i, line in enumerate(lines[:max_subtasks]):
             sub_tasks.append({
                 "id": f"subtask_{i}",
                 "description": line,

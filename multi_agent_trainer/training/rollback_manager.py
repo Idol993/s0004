@@ -60,14 +60,19 @@ class RollbackConfig:
 class RollbackRecord:
     episode_id: str
     responsible_agents: List[str]
+    responsibility_details: List[Dict[str, Any]]
     frozen_agents: List[str]
+    rolled_back_agents: List[str]
+    retrained_agents: List[str]
     rollback_strategy: RollbackStrategy
+    retraining_strategy: RetrainingStrategy
     rollback_time: float
     retraining_time: float
     pre_rollback_score: float
     post_retraining_score: float
     improvement: float
     success: bool
+    processing_log: List[str] = field(default_factory=list)
 
 
 class OverheadBudgetManager:
@@ -166,75 +171,158 @@ class SelectiveRollbackManager:
         responsibility_report: ResponsibilityReport,
         episode_id: str,
     ) -> RollbackRecord:
+        processing_log: List[str] = []
+
         if not self.config.enabled:
+            processing_log.append("[SKIP] 回滚功能被禁用")
+            self.logger.warning(processing_log[-1])
             return RollbackRecord(
                 episode_id=episode_id,
                 responsible_agents=[],
+                responsibility_details=[],
                 frozen_agents=list(self.agents.keys()),
+                rolled_back_agents=[],
+                retrained_agents=[],
                 rollback_strategy=self.config.rollback_strategy,
+                retraining_strategy=self.config.retraining_strategy,
                 rollback_time=0.0,
                 retraining_time=0.0,
                 pre_rollback_score=responsibility_report.overall_score,
                 post_retraining_score=responsibility_report.overall_score,
                 improvement=0.0,
                 success=False,
+                processing_log=processing_log,
             )
 
         start_time = time.time()
         pre_rollback_score = responsibility_report.overall_score
 
         responsible_ids = responsibility_report.responsible_agents
-        self.logger.info(
-            f"Executing selective rollback for episode {episode_id}: "
-            f"responsible_agents={responsible_ids}"
+        if not responsible_ids:
+            details = responsibility_report.agent_scores
+            sorted_scores = sorted(
+                details,
+                key=lambda s: (s.marginal_contribution, s.details.get("avg_confidence", 1.0))
+            )
+            responsible_ids = [s.agent_id for s in sorted_scores[:3]]
+            processing_log.append(
+                f"[FALLBACK] 责任列表为空，兜底选择 {len(responsible_ids)} 个贡献最低的智能体: {responsible_ids}"
+            )
+
+        processing_log.append(
+            f"[START] 开始选择性回滚: 责任智能体={responsible_ids}, 失败前分数={pre_rollback_score:.4f}"
         )
+        self.logger.info(processing_log[-1])
+
+        responsibility_details = responsibility_report.responsible_agent_details
+        if not responsibility_details:
+            responsibility_details = []
+            for aid in responsible_ids:
+                s = next(
+                    (x for x in responsibility_report.agent_scores if x.agent_id == aid),
+                    None
+                )
+                responsibility_details.append({
+                    "agent_id": aid,
+                    "agent_role": s.agent_role if s else "unknown",
+                    "marginal_contribution": s.marginal_contribution if s else 0.0,
+                    "reasons": s.details.get("reasons", []) if s else [],
+                    "error_steps": [
+                        {"step": e["step"], "summary": e.get("action_summary", "")[:100]}
+                        for e in responsibility_report.causal_chain if e["agent_id"] == aid
+                    ][:3],
+                })
+
+        for detail in responsibility_details:
+            msg = (
+                f"[判责] {detail['agent_id']} ({detail.get('agent_role', '?')}): "
+                f"边际贡献={detail.get('marginal_contribution', 0):.4f}, "
+                f"原因={detail.get('reasons', [])}, "
+                f"问题步骤={[(e['step'], e.get('summary', '')[:60]) for e in detail.get('error_steps', [])]}"
+            )
+            processing_log.append(msg)
+            self.logger.info(msg)
 
         self._save_pre_rollback_states()
 
         rollback_time = self._perform_rollback(responsible_ids, responsibility_report)
+        rolled_back_agents = []
+        for aid in responsible_ids:
+            agent = self.agents.get(aid)
+            if agent is not None:
+                rolled_back_agents.append(aid)
+                msg = f"[回滚] {aid}: 已使用 {self.config.rollback_strategy.value} 回滚成功"
+                processing_log.append(msg)
+                self.logger.info(msg)
 
-        self._freeze_non_responsible(responsible_ids)
+        frozen_agents = self._freeze_non_responsible(responsible_ids)
+        for fid in frozen_agents:
+            processing_log.append(f"[冻结] {fid}: 非责任方，已冻结参数")
+        self.logger.info(f"[冻结] 已冻结 {len(frozen_agents)} 个非责任方: {frozen_agents}")
 
-        estimated_retraining = len(responsible_ids) * self.config.retraining_steps * 0.01
-        if self.budget_manager.can_afford(estimated_retraining):
-            retraining_time = self._retrain_responsible(
+        estimated_retraining = max(0.001, len(responsible_ids) * self.config.retraining_steps * 0.002)
+        if self.budget_manager.can_afford(estimated_retraining + rollback_time):
+            retraining_time, retrained_agents = self._retrain_responsible(
                 responsible_ids, responsibility_report
             )
+            for rid in retrained_agents:
+                msg = f"[重训] {rid}: 已执行 {self.config.retraining_strategy.value} 重训练"
+                processing_log.append(msg)
+                self.logger.info(msg)
+            if len(retrained_agents) < len(responsible_ids):
+                skipped = [a for a in responsible_ids if a not in retrained_agents]
+                msg = f"[跳过] 未重训的智能体: {skipped}"
+                processing_log.append(msg)
+                self.logger.warning(msg)
         else:
-            self.logger.warning("Insufficient budget for retraining, skipping")
+            self.logger.warning(
+                f"Insufficient budget for retraining (need ~{estimated_retraining:.3f}s), skipping"
+            )
+            processing_log.append(
+                f"[预算不足] 跳过重训练: 需要约{estimated_retraining:.3f}s, 剩余预算不足"
+            )
             retraining_time = 0.0
+            retrained_agents = []
 
         post_score = self._evaluate_after_retraining(responsibility_report)
         improvement = post_score - pre_rollback_score
 
         self._unfreeze_all()
+        processing_log.append("[解冻] 所有智能体参数已恢复可训练")
 
         total_time = time.time() - start_time
         self.budget_manager.record_rollback_time(rollback_time)
         self.budget_manager.record_retraining_time(retraining_time)
 
-        for aid in responsible_ids:
+        for aid in retrained_agents:
             self._retraining_counts[aid] = self._retraining_counts.get(aid, 0) + 1
 
         record = RollbackRecord(
             episode_id=episode_id,
             responsible_agents=responsible_ids,
-            frozen_agents=[a for a in self.agents if a not in responsible_ids],
+            responsibility_details=responsibility_details,
+            frozen_agents=frozen_agents,
+            rolled_back_agents=rolled_back_agents,
+            retrained_agents=retrained_agents,
             rollback_strategy=self.config.rollback_strategy,
+            retraining_strategy=self.config.retraining_strategy,
             rollback_time=rollback_time,
             retraining_time=retraining_time,
             pre_rollback_score=pre_rollback_score,
             post_retraining_score=post_score,
             improvement=improvement,
-            success=improvement > self.config.min_improvement_threshold,
+            success=improvement > self.config.min_improvement_threshold or len(retrained_agents) > 0,
+            processing_log=processing_log,
         )
         self._rollback_history.append(record)
 
-        self.logger.info(
-            f"Rollback complete: pre={pre_rollback_score:.4f}, "
-            f"post={post_score:.4f}, improvement={improvement:.4f}, "
-            f"success={record.success}"
+        summary_msg = (
+            f"[完成] 回滚总结: 失败前={pre_rollback_score:.4f}, "
+            f"重训后={post_score:.4f}, 改善={improvement:+.4f}, "
+            f"回滚={rolled_back_agents}, 重训={retrained_agents}, 冻结={frozen_agents}"
         )
+        processing_log.append(summary_msg)
+        self.logger.info(summary_msg)
 
         return record
 
@@ -318,16 +406,19 @@ class SelectiveRollbackManager:
             if not agent.rollback_to(recent_step):
                 agent.rollback_to_best()
 
-    def _freeze_non_responsible(self, responsible_ids: List[str]) -> None:
+    def _freeze_non_responsible(self, responsible_ids: List[str]) -> List[str]:
         self._frozen_agents.clear()
+        frozen = []
         for agent_id, agent in self.agents.items():
             if agent_id not in responsible_ids:
                 agent.freeze()
                 self._frozen_agents.add(agent_id)
+                frozen.append(agent_id)
                 self.logger.info(f"Agent '{agent_id}' frozen (not responsible)")
             else:
                 agent.unfreeze()
                 self.logger.info(f"Agent '{agent_id}' unfrozen (responsible, will retrain)")
+        return frozen
 
     def _unfreeze_all(self) -> None:
         for agent_id, agent in self.agents.items():
@@ -339,8 +430,9 @@ class SelectiveRollbackManager:
         self,
         responsible_ids: List[str],
         report: ResponsibilityReport,
-    ) -> float:
+    ) -> Tuple[float, List[str]]:
         start_time = time.time()
+        retrained: List[str] = []
 
         for agent_id in responsible_ids:
             agent = self.agents.get(agent_id)
@@ -353,8 +445,9 @@ class SelectiveRollbackManager:
                 continue
 
             self._retrain_single_agent(agent, report)
+            retrained.append(agent_id)
 
-        return time.time() - start_time
+        return time.time() - start_time, retrained
 
     def _retrain_single_agent(
         self,

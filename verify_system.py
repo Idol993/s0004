@@ -290,6 +290,15 @@ def test_selective_rollback():
         task_success=False,
         overall_score=0.3,
         responsible_agents=["executor"],
+        responsible_agent_details=[
+            {
+                "agent_id": "executor",
+                "agent_role": "executor",
+                "marginal_contribution": -0.5,
+                "reasons": ["动作置信度过低"],
+                "error_steps": [{"step": 1, "summary": "执行动作失败"}],
+            }
+        ],
         causal_chain=[
             {"step": 0, "agent_id": "planner", "is_error_step": False},
             {"step": 1, "agent_id": "executor", "is_error_step": True},

@@ -25,7 +25,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--log_dir", type=str, default="./logs", help="日志目录")
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints", help="检查点目录")
-    parser.add_argument("--model_name", type=str, default="gpt2-medium", help="基础模型名称")
+    parser.add_argument("--model_name", type=str, default="gpt2", help="基础模型名称（默认gpt2，124MB轻量版）")
     parser.add_argument("--max_overhead", type=float, default=0.15, help="最大开销比例")
     return parser.parse_args()
 
@@ -104,14 +104,34 @@ def main():
     def episode_callback(result):
         status = "SUCCESS" if result.success else "FAILED"
         print(f"  Episode {result.episode_id}: {status} (score={result.score:.4f})")
+        print(f"    总耗时: {result.episode_time:.3f}s, 开销: {result.overhead_time:.3f}s "
+              f"({result.overhead_time / max(result.episode_time, 1e-8):.1%})")
         if result.responsibility_report:
             report = result.responsibility_report
             print(f"    责任智能体: {report.responsible_agents}")
-            print(f"    推断开销: {report.inference_time:.3f}s")
+            for detail in report.responsible_agent_details:
+                print(f"      - {detail['agent_id']} ({detail.get('agent_role', '?')}): "
+                      f"MC={detail.get('marginal_contribution', 0):.4f}")
+                for reason in detail.get('reasons', []):
+                    print(f"          原因: {reason}")
+                for err in detail.get('error_steps', [])[:2]:
+                    print(f"          问题步骤 step{err.get('step','?')}: {err.get('summary','')[:80]}")
+            print(f"    责任推断开销: {report.inference_time:.3f}s, 采样数: {report.num_samples_used}")
             if result.rollback_record:
                 rb = result.rollback_record
-                print(f"    回滚策略: {rb.rollback_strategy.value}")
-                print(f"    改善幅度: {rb.improvement:.4f}")
+                print(f"  --- 回滚与重训详情 ---")
+                print(f"    失败前分数: {rb.pre_rollback_score:.4f}")
+                print(f"    重训后分数: {rb.post_retraining_score:.4f}")
+                print(f"    改善幅度: {rb.improvement:+.4f}")
+                print(f"    回滚策略: {rb.rollback_strategy.value}, 重训策略: {rb.retraining_strategy.value}")
+                print(f"    实际回滚的智能体: {rb.rolled_back_agents}")
+                print(f"    实际重训的智能体: {rb.retrained_agents}")
+                print(f"    被冻结的智能体 (非责任方): {rb.frozen_agents}")
+                print(f"    回滚耗时: {rb.rollback_time:.3f}s, 重训耗时: {rb.retraining_time:.3f}s")
+                if rb.processing_log:
+                    print(f"    处理日志:")
+                    for line in rb.processing_log:
+                        print(f"      {line}")
 
     print("开始训练...")
     print("-" * 70)
@@ -128,22 +148,34 @@ def main():
     print(f"  最终平均分: {summary['final_avg_score']:.4f}")
     print(f"  最佳分数: {summary['best_score']:.4f}")
     print(f"  总体成功率: {summary['overall_success_rate']:.2%}")
-    print(f"  总训练时间: {summary['total_training_time']:.2f}s")
+    print(f"  总耗时: {summary['total_time']:.2f}s")
+    print(f"  纯训练时间: {summary.get('pure_training_time', 0):.2f}s")
     print(f"  总开销时间: {summary['total_overhead_time']:.2f}s")
-    print(f"  开销比例: {summary['overhead_ratio']:.2%}")
-    print(f"  开销在预算内: {'是' if summary['overhead_within_budget'] else '否'}")
+    print(f"  通信时间: {summary.get('communication_time', 0):.4f}s (消息数={summary.get('num_messages', 0)})")
+    print(f"  开销比例: {summary['overhead_ratio']:.2%} (预算上限 {summary.get('max_overhead_ratio', 0.15):.0%})")
+    print(f"  开销在预算内: {'是 ✓' if summary['overhead_within_budget'] else '否 ✗'}")
     print(f"  回滚次数: {summary['num_rollbacks']}")
     if summary['num_rollbacks'] > 0:
         print(f"  回滚成功率: {summary['rollback_success_rate']:.2%}")
 
     budget = summary.get('budget_report', {})
     if budget:
-        print(f"\n预算报告:")
-        print(f"  通信时间: {budget.get('communication_time', 0):.2f}s")
-        print(f"  推断时间: {budget.get('inference_time', 0):.2f}s")
-        print(f"  回滚时间: {budget.get('rollback_time', 0):.2f}s")
-        print(f"  重训练时间: {budget.get('retraining_time', 0):.2f}s")
+        print(f"\n细粒度预算报告 (来自 OverheadBudgetManager):")
+        print(f"  训练时间: {budget.get('total_training_time', 0):.3f}s")
+        print(f"  通信时间: {budget.get('communication_time', budget.get('communication_time_from_bus', 0)):.3f}s")
+        print(f"  推断时间: {budget.get('inference_time', 0):.3f}s")
+        print(f"  回滚时间: {budget.get('rollback_time', 0):.3f}s")
+        print(f"  重训练时间: {budget.get('retraining_time', 0):.3f}s")
+        print(f"  当前开销比例: {budget.get('overhead_ratio', 0):.4%}")
         print(f"  剩余预算: {budget.get('remaining_budget', 0):.2%}")
+        print(f"  预算是否充足: {'是' if budget.get('within_budget', True) else '否'}")
+
+    resp_stats = summary.get('responsibility_stats', {})
+    if resp_stats:
+        print(f"\n责任推断统计:")
+        print(f"  总推断时间: {resp_stats.get('total_inference_time', 0):.3f}s")
+        print(f"  总训练时间参考: {resp_stats.get('total_training_time', 0):.3f}s")
+        print(f"  推断开销比: {resp_stats.get('overhead_ratio', 0):.4%}")
 
     agent_stats = orchestrator.get_agent_statistics()
     print(f"\n智能体统计:")

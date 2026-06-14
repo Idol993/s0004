@@ -81,7 +81,7 @@ class MemoryAgent(BaseAgent):
         max_memories: int = 10000,
     ):
         if llm_config is None:
-            llm_config = LLMConfig(model_name="gpt2-medium")
+            llm_config = LLMConfig(model_name="gpt2")
         super().__init__(
             agent_id=agent_id,
             role=AgentRole.MEMORY,
@@ -177,19 +177,42 @@ class MemoryAgent(BaseAgent):
 
     def _encode_text(self, text: str) -> torch.Tensor:
         if self.llm.model is None:
-            return torch.randn(self._embedding_dim)
+            return self._hash_embedding(text)
 
-        inputs = self.llm.encode(text)
-        with torch.no_grad():
-            outputs = self.llm.model(**inputs, output_hidden_states=True)
-            last_hidden = outputs.hidden_states[-1][:, -1, :]
+        try:
+            short_text = text[:256] if len(text) > 256 else text
+            inputs = self.llm.encode(short_text)
 
-        if self._embedding_proj is not None:
-            embedding = self._embedding_proj(last_hidden)
-        else:
-            embedding = last_hidden[:, :self._embedding_dim]
+            max_len = 64
+            if inputs["input_ids"].shape[-1] > max_len:
+                inputs = {
+                    "input_ids": inputs["input_ids"][:, :max_len],
+                    "attention_mask": inputs["attention_mask"][:, :max_len],
+                }
 
-        return embedding
+            with torch.no_grad():
+                outputs = self.llm.model(**inputs, output_hidden_states=True)
+                last_hidden = outputs.hidden_states[-1][:, -1, :]
+
+                del outputs
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            if self._embedding_proj is not None:
+                embedding = self._embedding_proj(last_hidden)
+            else:
+                embedding = last_hidden[:, :self._embedding_dim]
+
+            return embedding.squeeze(0).detach().cpu()
+        except (RuntimeError, MemoryError) as e:
+            self.logger.warning(f"Memory agent LLM encoding failed ({e}), using hash fallback")
+            return self._hash_embedding(text)
+
+    def _hash_embedding(self, text: str) -> torch.Tensor:
+        rng = np.random.RandomState(hash(text) & 0xFFFFFFFF)
+        vec = rng.randn(self._embedding_dim).astype(np.float32)
+        vec /= np.linalg.norm(vec) + 1e-8
+        return torch.tensor(vec, dtype=torch.float32)
 
     def _compute_importance(self, data: Dict[str, Any]) -> float:
         importance = 0.5

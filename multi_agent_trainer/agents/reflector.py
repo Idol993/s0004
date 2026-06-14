@@ -19,7 +19,7 @@ class ReflectorAgent(BaseAgent):
         log_dir: str = "./logs",
     ):
         if llm_config is None:
-            llm_config = LLMConfig(model_name="gpt2-medium")
+            llm_config = LLMConfig(model_name="gpt2")
         super().__init__(
             agent_id=agent_id,
             role=AgentRole.REFLECTOR,
@@ -30,6 +30,7 @@ class ReflectorAgent(BaseAgent):
         )
         self._reflection_history: List[Dict[str, Any]] = []
         self._improvement_suggestions: List[Dict[str, Any]] = []
+        self._processed_episodes: set = set()
 
     def perceive(self, observation: Dict[str, Any]) -> Dict[str, Any]:
         evaluation = observation.get("evaluation", {})
@@ -98,6 +99,15 @@ class ReflectorAgent(BaseAgent):
         return decision
 
     def act(self, decision: Dict[str, Any]) -> Dict[str, Any]:
+        episode_id = getattr(self, '_current_episode', None)
+        if episode_id is not None and episode_id in self._processed_episodes:
+            self.logger.info(f"Episode {episode_id} reflection already processed, skipping duplicate")
+            return {
+                "action_type": "reflect_skipped",
+                "reason": "duplicate_episode",
+                "episode_id": episode_id,
+            }
+
         reflection = {
             "action_type": "reflect",
             "is_failure": decision["is_failure"],
@@ -105,10 +115,13 @@ class ReflectorAgent(BaseAgent):
             "error_analysis": decision["error_analysis"],
             "improvement_suggestions": decision["improvement_suggestions"],
             "root_cause": decision["root_cause_hypothesis"],
+            "episode_id": episode_id,
         }
 
         self._reflection_history.append(reflection)
         self._improvement_suggestions.extend(decision["improvement_suggestions"])
+        if episode_id is not None:
+            self._processed_episodes.add(episode_id)
 
         self.send_message(
             receiver="planner",
@@ -117,6 +130,7 @@ class ReflectorAgent(BaseAgent):
                 "improvement_suggestions": decision["improvement_suggestions"],
                 "root_cause": decision["root_cause_hypothesis"],
                 "is_failure": decision["is_failure"],
+                "episode_id": episode_id,
             },
         )
 
@@ -132,6 +146,7 @@ class ReflectorAgent(BaseAgent):
                         "error_analysis": decision["error_analysis"],
                         "root_cause": decision["root_cause_hypothesis"],
                         "failed": True,
+                        "episode_id": episode_id,
                     },
                 },
             )

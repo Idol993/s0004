@@ -19,7 +19,7 @@ class ExecutorAgent(BaseAgent):
         log_dir: str = "./logs",
     ):
         if llm_config is None:
-            llm_config = LLMConfig(model_name="gpt2-medium")
+            llm_config = LLMConfig(model_name="gpt2")
         super().__init__(
             agent_id=agent_id,
             role=AgentRole.EXECUTOR,

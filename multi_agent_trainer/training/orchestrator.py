@@ -180,8 +180,14 @@ class TrainingOrchestrator:
             episode_id = f"ep_{self._current_episode}"
 
         episode_start = time.time()
-        overhead_start = time.time()
-        overhead_time = 0.0
+
+        communication_time_before = self.message_bus.get_metrics().communication_time
+        overhead_components: Dict[str, float] = {
+            "responsibility_inference": 0.0,
+            "mdp_credit": 0.0,
+            "rollback": 0.0,
+            "reflection": 0.0,
+        }
 
         self.logger.info(f"=== Starting episode {episode_id} ===")
 
@@ -190,36 +196,40 @@ class TrainingOrchestrator:
 
         trajectory: List[ActionRecord] = []
 
-        with self._timer:
-            planner = self.agents["planner"]
-            plan_observation = {
-                "task": task,
-                "context": context or {},
-                "constraints": {},
-            }
-            plan_result = planner.step(plan_observation)
-            trajectory.extend(planner.action_history)
+        t0 = time.time()
+        planner = self.agents["planner"]
+        plan_observation = {
+            "task": task,
+            "context": context or {},
+            "constraints": {},
+        }
+        plan_result = planner.step(plan_observation)
+        trajectory.extend(planner.action_history)
+        training_time_planner = time.time() - t0
 
         plan = plan_result.get("sub_tasks", [])
         self.logger.info(f"Planner created {len(plan)} sub-tasks")
 
         execution_results: List[Dict[str, Any]] = []
 
+        t_exec_total = 0.0
         for i, sub_task in enumerate(plan):
-            with self._timer:
-                executor = self.agents["executor"]
-                exec_observation = {
-                    "sub_task": sub_task,
-                    "plan_context": {"task": task, "sub_task_index": i},
-                    "available_tools": [],
-                }
-                exec_result = executor.step(exec_observation)
-                trajectory.extend(
-                    [a for a in executor.action_history if a.episode_id == episode_id]
-                )
+            t1 = time.time()
+            executor = self.agents["executor"]
+            exec_observation = {
+                "sub_task": sub_task,
+                "plan_context": {"task": task, "sub_task_index": i},
+                "available_tools": [],
+            }
+            exec_result = executor.step(exec_observation)
+            trajectory.extend(
+                [a for a in executor.action_history if a.episode_id == episode_id]
+            )
+            t_exec_total += time.time() - t1
 
             execution_results.append(exec_result)
 
+            t_mem = time.time()
             mem = self.agents["memory"]
             mem_observation = {
                 "query": f"execution result for sub_task {i}",
@@ -232,16 +242,18 @@ class TrainingOrchestrator:
                 },
             }
             mem.step(mem_observation)
+            t_exec_total += time.time() - t_mem
 
-        with self._timer:
-            evaluator = self.agents["evaluator"]
-            eval_observation = {
-                "task_result": execution_results,
-                "original_task": task,
-                "execution_log": execution_results,
-                "criteria": {},
-            }
-            eval_result = evaluator.step(eval_observation)
+        t2 = time.time()
+        evaluator = self.agents["evaluator"]
+        eval_observation = {
+            "task_result": execution_results,
+            "original_task": task,
+            "execution_log": execution_results,
+            "criteria": {},
+        }
+        eval_result = evaluator.step(eval_observation)
+        training_time_eval = time.time() - t2
 
         score = eval_result.get("score", 0.0)
         success = eval_result.get("success", False)
@@ -251,7 +263,7 @@ class TrainingOrchestrator:
         rollback_record = None
 
         if not success:
-            overhead_start_cf = time.time()
+            t_cf_start = time.time()
 
             responsibility_report = self.responsibility_inferencer.infer_responsibility(
                 episode_id=episode_id,
@@ -259,49 +271,55 @@ class TrainingOrchestrator:
                 outcome_score=score,
                 task_success=success,
             )
+            overhead_components["responsibility_inference"] = time.time() - t_cf_start
 
             self.logger.info(
                 f"Responsible agents: {responsibility_report.responsible_agents}"
             )
+            for detail in responsibility_report.responsible_agent_details:
+                self.logger.info(
+                    f"  -> {detail['agent_id']} ({detail.get('agent_role', '?')}): "
+                    f"MC={detail.get('marginal_contribution', 0):.4f}, "
+                    f"reasons={detail.get('reasons', [])}"
+                )
 
+            t_mdp_start = time.time()
             delayed_credits = self.mdp_credit_network.compute_delayed_credit_assignment(
                 trajectory=self._collect_trajectory(episode_id),
                 final_reward=score,
                 episode_id=episode_id,
             )
+            overhead_components["mdp_credit"] = time.time() - t_mdp_start
 
             self._apply_delayed_credits(delayed_credits, episode_id)
 
+            t_rb_start = time.time()
             rollback_record = self.rollback_manager.execute_rollback(
                 responsibility_report=responsibility_report,
                 episode_id=episode_id,
             )
-
-            overhead_time = time.time() - overhead_start_cf
+            overhead_components["rollback"] = time.time() - t_rb_start
 
             self.rollback_manager.budget_manager.record_inference_time(
-                responsibility_report.inference_time
+                overhead_components["responsibility_inference"]
             )
         else:
-            with self._timer:
-                reflector = self.agents["reflector"]
-                reflect_observation = {
-                    "evaluation": eval_result,
-                    "execution_log": execution_results,
-                    "plan": plan,
-                }
-                reflector.step(reflect_observation)
-
-        with self._timer:
+            t_ref_start = time.time()
             reflector = self.agents["reflector"]
             reflect_observation = {
                 "evaluation": eval_result,
                 "execution_log": execution_results,
                 "plan": plan,
-                "failure_info": {} if success else {"score": score},
+                "failure_info": {},
             }
             reflector.step(reflect_observation)
+            overhead_components["reflection"] = time.time() - t_ref_start
 
+        communication_time_after = self.message_bus.get_metrics().communication_time
+        communication_time_ep = max(0.0, communication_time_after - communication_time_before)
+
+        total_agent_training_time = training_time_planner + t_exec_total + training_time_eval
+        total_overhead_time = sum(overhead_components.values())
         episode_time = time.time() - episode_start
 
         if success:
@@ -310,13 +328,17 @@ class TrainingOrchestrator:
             self.metrics.failure_count += 1
 
         self.metrics.total_time += episode_time
-        self.metrics.communication_time = self.message_bus.get_metrics().communication_time
+        self.metrics.communication_time += communication_time_ep
+        self.metrics.overhead_time += total_overhead_time
 
-        self.responsibility_inferencer.update_training_time(episode_time - overhead_time)
-        self.rollback_manager.budget_manager.record_training_time(episode_time - overhead_time)
+        pure_training_time = max(0.0, episode_time - total_overhead_time - communication_time_ep)
+        self.responsibility_inferencer.update_training_time(pure_training_time)
+        self.rollback_manager.budget_manager.record_training_time(pure_training_time)
+        self.rollback_manager.budget_manager.record_communication_time(communication_time_ep)
 
         self._record_transitions_to_mdp(episode_id)
 
+        overhead_time = total_overhead_time + communication_time_ep
         result = EpisodeResult(
             episode_id=episode_id,
             success=success,
@@ -333,7 +355,10 @@ class TrainingOrchestrator:
         self.logger.info(
             f"Episode {episode_id} complete: "
             f"success={success}, score={score:.4f}, "
-            f"time={episode_time:.2f}s, overhead={overhead_time:.2f}s"
+            f"total={episode_time:.3f}s, "
+            f"overhead={overhead_time:.3f}s ({overhead_time/max(episode_time,1e-8):.1%}), "
+            f"comm={communication_time_ep:.3f}s, "
+            f"components={ {k: f'{v:.3f}s' for k, v in overhead_components.items()} }"
         )
 
         return result
@@ -453,20 +478,40 @@ class TrainingOrchestrator:
         total_time = sum(times)
         overhead_ratio = total_overhead_time / max(total_time, 1e-8)
 
+        bus_metrics = self.message_bus.get_metrics()
+        total_comm_time = bus_metrics.communication_time
+        total_msg_count = bus_metrics.num_messages
+
+        budget_report = dict(self.rollback_manager.budget_report)
+        budget_report["communication_time_from_bus"] = total_comm_time
+        budget_report["total_messages"] = total_msg_count
+
+        budget_report["orchestrator_metrics"] = {
+            "total_time": self.metrics.total_time,
+            "communication_time": self.metrics.communication_time,
+            "overhead_time": self.metrics.overhead_time,
+            "success_count": self.metrics.success_count,
+            "failure_count": self.metrics.failure_count,
+        }
+
         return {
             "total_episodes": len(results),
             "final_avg_score": float(np.mean(scores[-10:])),
             "best_score": float(max(scores)),
             "overall_success_rate": float(np.mean(successes)),
-            "total_training_time": total_time,
+            "total_time": total_time,
+            "pure_training_time": max(0.0, total_time - total_overhead_time),
             "total_overhead_time": total_overhead_time,
+            "communication_time": total_comm_time,
+            "num_messages": total_msg_count,
             "overhead_ratio": overhead_ratio,
             "overhead_within_budget": overhead_ratio <= self.config.max_overhead_ratio,
+            "max_overhead_ratio": self.config.max_overhead_ratio,
             "num_rollbacks": num_rollbacks,
             "rollback_success_rate": (
                 rollback_successes / max(num_rollbacks, 1)
             ),
-            "budget_report": self.rollback_manager.budget_report,
+            "budget_report": budget_report,
             "responsibility_stats": self.responsibility_inferencer.get_overhead_stats(),
         }
 

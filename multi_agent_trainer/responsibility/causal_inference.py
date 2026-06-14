@@ -61,6 +61,7 @@ class ResponsibilityReport:
     overall_score: float
     agent_scores: List[ResponsibilityScore]
     responsible_agents: List[str]
+    responsible_agent_details: List[Dict[str, Any]]
     causal_chain: List[Dict[str, Any]]
     inference_time: float
     num_samples_used: int
@@ -443,6 +444,41 @@ class CausalResponsibilityInferencer:
             )
             responsible_agents = responsible_agents[:self.max_responsible_agents]
 
+            if not task_success and not responsible_agents:
+                sorted_scores = sorted(
+                    agent_scores,
+                    key=lambda s: (s.marginal_contribution, s.details.get("avg_confidence", 1.0))
+                )
+                fallback_count = min(self.max_responsible_agents, max(1, len(sorted_scores)))
+                responsible_agents = [s.agent_id for s in sorted_scores[:fallback_count]]
+                for s in sorted_scores[:fallback_count]:
+                    s.is_responsible = True
+                    s.details["fallback_assignment"] = True
+                    s.details["fallback_reason"] = (
+                        f"未超过阈值但作为兜底责任方, "
+                        f"边际贡献={s.marginal_contribution:.4f}, "
+                        f"平均置信度={s.details.get('avg_confidence', 0):.2f}"
+                    )
+
+            for s in agent_scores:
+                if s.is_responsible:
+                    reasons = []
+                    if s.marginal_contribution < -self.responsibility_threshold:
+                        reasons.append(
+                            f"边际贡献 {s.marginal_contribution:.4f} 低于阈值 {-self.responsibility_threshold:.2f}"
+                        )
+                    if s.details.get("avg_confidence", 1.0) < 0.4:
+                        reasons.append(
+                            f"动作平均置信度 {s.details.get('avg_confidence', 0):.2f} 偏低"
+                        )
+                    if s.details.get("fallback_assignment"):
+                        reasons.append(s.details.get("fallback_reason", "兜底分配"))
+                    if not reasons:
+                        reasons.append(
+                            f"综合评分排名靠后 (贡献={s.marginal_contribution:.4f}, Shapley={s.shapley_value:.4f})"
+                        )
+                    s.details["reasons"] = reasons
+
             causal_chain = self._build_causal_chain(trajectory, agent_scores, task_success)
 
         inference_time = time.time() - start_time
@@ -457,12 +493,46 @@ class CausalResponsibilityInferencer:
         if self.config.shapley_enabled:
             num_samples_used += self.config.shapley_num_permutations * len(agent_ids)
 
+        responsible_details = []
+        for agent_id in responsible_agents:
+            s = next((x for x in agent_scores if x.agent_id == agent_id), None)
+            if not s:
+                continue
+            agent_error_steps = [
+                {
+                    "step": entry["step"],
+                    "summary": entry.get("action_summary", "")[:150],
+                    "contribution": entry.get("marginal_contribution", 0.0),
+                }
+                for entry in causal_chain
+                if entry["agent_id"] == agent_id and entry.get("is_error_step", agent_id in responsible_agents)
+            ]
+            if not agent_error_steps:
+                agent_steps = [e for e in causal_chain if e["agent_id"] == agent_id]
+                if agent_steps:
+                    worst = min(agent_steps, key=lambda e: e.get("marginal_contribution", 0))
+                    agent_error_steps.append({
+                        "step": worst["step"],
+                        "summary": worst.get("action_summary", "")[:150],
+                        "contribution": worst.get("marginal_contribution", 0.0),
+                    })
+            responsible_details.append({
+                "agent_id": agent_id,
+                "agent_role": s.agent_role,
+                "marginal_contribution": s.marginal_contribution,
+                "shapley_value": s.shapley_value,
+                "reasons": s.details.get("reasons", []),
+                "error_steps": agent_error_steps,
+                "fallback_assignment": s.details.get("fallback_assignment", False),
+            })
+
         report = ResponsibilityReport(
             episode_id=episode_id,
             task_success=task_success,
             overall_score=outcome_score,
             agent_scores=agent_scores,
             responsible_agents=responsible_agents,
+            responsible_agent_details=responsible_details,
             causal_chain=causal_chain,
             inference_time=inference_time,
             num_samples_used=num_samples_used,

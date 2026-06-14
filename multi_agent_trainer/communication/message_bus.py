@@ -205,6 +205,7 @@ class CentralMessageBus:
         self._subscriptions.unsubscribe(agent_id, topic, msg_type)
 
     def send(self, msg: Message, use_compression: Optional[bool] = None) -> bool:
+        t0 = time.time()
         if use_compression is None:
             use_compression = self.compression_enabled
         if use_compression and msg.size_bytes > 1024:
@@ -214,6 +215,7 @@ class CentralMessageBus:
             recipients = self._subscriptions.get_recipients(msg)
             if not recipients:
                 self.logger.warning(f"No recipients for message {msg.msg_id} of type {msg.msg_type}")
+                self._metrics.communication_time += time.time() - t0
                 return False
 
             success_count = 0
@@ -239,11 +241,14 @@ class CentralMessageBus:
                     }
                 )
 
+            self._metrics.communication_time += time.time() - t0
             return success_count > 0
 
     def receive(self, agent_id: str, timeout: Optional[float] = None) -> Optional[Message]:
+        t0 = time.time()
         with self._lock:
             if agent_id not in self._queues:
+                self._metrics.communication_time += time.time() - t0
                 return None
             q = self._queues[agent_id]
 
@@ -256,9 +261,11 @@ class CentralMessageBus:
                         self._callbacks[agent_id](msg)
                     except Exception as e:
                         self.logger.error(f"Callback error for agent {agent_id}: {e}")
+        self._metrics.communication_time += time.time() - t0
         return msg
 
     def broadcast(self, msg: Message) -> int:
+        t0 = time.time()
         msg.receiver = "*"
         count = 0
         with self._lock:
@@ -268,6 +275,7 @@ class CentralMessageBus:
                 if self._queues[agent_id].put(msg_copy):
                     count += 1
         self._metrics.num_messages += count
+        self._metrics.communication_time += time.time() - t0
         return count
 
     def request_response(
