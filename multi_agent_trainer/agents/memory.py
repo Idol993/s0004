@@ -1,6 +1,7 @@
 """记忆器智能体 - 负责经验存储、检索和知识管理"""
 
 from typing import Any, Dict, List, Optional, Tuple
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -116,64 +117,77 @@ class MemoryAgent(BaseAgent):
         }
 
     def decide(self, perceived_state: Dict[str, Any]) -> Dict[str, Any]:
-        query_type = perceived_state["query_type"]
+        try:
+            query_type = perceived_state["query_type"]
 
-        if query_type == "retrieve":
-            query_embedding = self._encode_text(perceived_state["query"])
-            results = self._memory_index.retrieve(query_embedding, top_k=5)
-            return {
-                "action": "retrieve",
-                "results": [(v, s) for v, s in results],
-                "query": perceived_state["query"],
-            }
-        elif query_type == "store" and perceived_state["data_to_store"]:
-            data = perceived_state["data_to_store"]
-            importance = self._compute_importance(data)
-            key_embedding = self._encode_text(str(data)[:500])
-            return {
-                "action": "store",
-                "data": data,
-                "key_embedding": key_embedding,
-                "importance": importance,
-            }
-        else:
-            return {"action": "noop", "query": perceived_state["query"]}
+            if query_type == "retrieve":
+                query_embedding = self._encode_text(perceived_state["query"])
+                results = self._memory_index.retrieve(query_embedding, top_k=5)
+                return {
+                    "action": "retrieve",
+                    "results": [(v, s) for v, s in results],
+                    "query": perceived_state["query"],
+                }
+            elif query_type == "store" and perceived_state["data_to_store"]:
+                data = perceived_state["data_to_store"]
+                importance = self._compute_importance(data)
+                key_embedding = self._encode_text(str(data)[:500])
+                return {
+                    "action": "store",
+                    "data": data,
+                    "key_embedding": key_embedding,
+                    "importance": importance,
+                }
+            else:
+                return {"action": "noop", "query": perceived_state["query"]}
+        except Exception as e:
+            self.logger.warning(f"Memory agent decide failed: {e}, falling back to no-op")
+            return {"action": "noop", "query": perceived_state.get("query", ""), "error": str(e)}
 
     def act(self, decision: Dict[str, Any]) -> Dict[str, Any]:
-        if decision["action"] == "store":
-            self._memory_index.add(
-                decision["key_embedding"],
-                decision["data"],
-                decision["importance"],
-            )
-            self._short_term.append(decision["data"])
+        try:
+            if decision["action"] == "store":
+                self._memory_index.add(
+                    decision["key_embedding"],
+                    decision["data"],
+                    decision["importance"],
+                )
+                self._short_term.append(decision["data"])
 
-            self.send_message(
-                receiver="*",
-                msg_type=MessageType.MEMORY_RESULT,
-                content={
-                    "action": "stored",
-                    "importance": decision["importance"],
+                self.send_message(
+                    receiver="*",
+                    msg_type=MessageType.MEMORY_RESULT,
+                    content={
+                        "action": "stored",
+                        "importance": decision["importance"],
+                        "memory_size": self._memory_index.size,
+                    },
+                )
+                return {
+                    "action_type": "store",
+                    "success": True,
                     "memory_size": self._memory_index.size,
-                },
-            )
+                }
+
+            elif decision["action"] == "retrieve":
+                results = decision["results"]
+                requester = decision.get("query", "")
+
+                return {
+                    "action_type": "retrieve",
+                    "results": results,
+                    "num_retrieved": len(results),
+                }
+
+            return {"action_type": "noop"}
+        except Exception as e:
+            self.logger.warning(f"Memory agent act failed: {e}, returning empty result")
             return {
-                "action_type": "store",
-                "success": True,
-                "memory_size": self._memory_index.size,
+                "action_type": "error",
+                "success": False,
+                "error": str(e),
+                "memory_size": self._memory_index.size if hasattr(self, '_memory_index') else 0,
             }
-
-        elif decision["action"] == "retrieve":
-            results = decision["results"]
-            requester = decision.get("query", "")
-
-            return {
-                "action_type": "retrieve",
-                "results": results,
-                "num_retrieved": len(results),
-            }
-
-        return {"action_type": "noop"}
 
     def _encode_text(self, text: str) -> torch.Tensor:
         if self.llm.model is None:

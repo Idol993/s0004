@@ -84,6 +84,7 @@ class OverheadBudgetManager:
         self._retraining_time: float = 0.0
         self._inference_time: float = 0.0
         self._communication_time: float = 0.0
+        self._reflection_time: float = 0.0
         self._lock = None
 
     @property
@@ -123,6 +124,10 @@ class OverheadBudgetManager:
         self._communication_time += duration
         self._total_overhead_time += duration
 
+    def record_reflection_time(self, duration: float) -> None:
+        self._reflection_time += duration
+        self._total_overhead_time += duration
+
     def can_afford(self, estimated_time: float) -> bool:
         if self._total_training_time <= 0:
             return True
@@ -140,6 +145,7 @@ class OverheadBudgetManager:
             "retraining_time": self._retraining_time,
             "inference_time": self._inference_time,
             "communication_time": self._communication_time,
+            "reflection_time": self._reflection_time,
             "within_budget": self.current_ratio <= self.max_overhead_ratio,
         }
 
@@ -289,6 +295,9 @@ class SelectiveRollbackManager:
 
         self._unfreeze_all()
         processing_log.append("[解冻] 所有智能体参数已恢复可训练")
+        processing_log.append(
+            f"[重评] 初步估算分数={post_score:.4f} (将由编排器用真实重跑结果覆盖)"
+        )
 
         total_time = time.time() - start_time
         self.budget_manager.record_rollback_time(rollback_time)

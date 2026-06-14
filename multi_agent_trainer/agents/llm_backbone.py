@@ -127,7 +127,7 @@ class LLMBackbone:
         return self._is_frozen
 
     def encode(self, text: Union[str, List[str]], **kwargs) -> Dict[str, torch.Tensor]:
-        max_len = min(self.config.max_length, 128)
+        max_len = min(self.config.max_length, 64)
         default_kwargs = {
             "return_tensors": "pt",
             "padding": True,
@@ -148,7 +148,7 @@ class LLMBackbone:
             self.model.eval()
             inputs = self.encode(prompt)
             default_kwargs = {
-                "max_new_tokens": min(128, kwargs.pop("max_new_tokens", 256)),
+                "max_new_tokens": min(64, kwargs.pop("max_new_tokens", 256)),
                 "temperature": 0.7,
                 "top_p": 0.9,
                 "do_sample": True,

@@ -166,6 +166,7 @@ def main():
         print(f"  推断时间: {budget.get('inference_time', 0):.3f}s")
         print(f"  回滚时间: {budget.get('rollback_time', 0):.3f}s")
         print(f"  重训练时间: {budget.get('retraining_time', 0):.3f}s")
+        print(f"  反思时间: {budget.get('reflection_time', 0):.3f}s")
         print(f"  当前开销比例: {budget.get('overhead_ratio', 0):.4%}")
         print(f"  剩余预算: {budget.get('remaining_budget', 0):.2%}")
         print(f"  预算是否充足: {'是' if budget.get('within_budget', True) else '否'}")

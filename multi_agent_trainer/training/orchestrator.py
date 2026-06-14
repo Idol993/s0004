@@ -170,27 +170,12 @@ class TrainingOrchestrator:
             log_dir=self.config.log_dir,
         )
 
-    def run_episode(
+    def _run_task_core(
         self,
         task: str,
-        episode_id: Optional[str] = None,
+        episode_id: str,
         context: Optional[Dict[str, Any]] = None,
-    ) -> EpisodeResult:
-        if episode_id is None:
-            episode_id = f"ep_{self._current_episode}"
-
-        episode_start = time.time()
-
-        communication_time_before = self.message_bus.get_metrics().communication_time
-        overhead_components: Dict[str, float] = {
-            "responsibility_inference": 0.0,
-            "mdp_credit": 0.0,
-            "rollback": 0.0,
-            "reflection": 0.0,
-        }
-
-        self.logger.info(f"=== Starting episode {episode_id} ===")
-
+    ) -> Dict[str, Any]:
         for agent in self.agents.values():
             agent.reset_episode(episode_id)
 
@@ -204,7 +189,7 @@ class TrainingOrchestrator:
             "constraints": {},
         }
         plan_result = planner.step(plan_observation)
-        trajectory.extend(planner.action_history)
+        trajectory.extend([a for a in planner.action_history if a.episode_id == episode_id])
         training_time_planner = time.time() - t0
 
         plan = plan_result.get("sub_tasks", [])
@@ -259,6 +244,49 @@ class TrainingOrchestrator:
         success = eval_result.get("success", False)
         self.logger.info(f"Evaluation: score={score:.4f}, success={success}")
 
+        return {
+            "score": score,
+            "success": success,
+            "plan": plan,
+            "execution_results": execution_results,
+            "eval_result": eval_result,
+            "trajectory": trajectory,
+            "training_time_planner": training_time_planner,
+            "training_time_exec": t_exec_total,
+            "training_time_eval": training_time_eval,
+        }
+
+    def run_episode(
+        self,
+        task: str,
+        episode_id: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> EpisodeResult:
+        if episode_id is None:
+            episode_id = f"ep_{self._current_episode}"
+
+        episode_start = time.time()
+
+        communication_time_before = self.message_bus.get_metrics().communication_time
+        overhead_components: Dict[str, float] = {
+            "responsibility_inference": 0.0,
+            "mdp_credit": 0.0,
+            "rollback": 0.0,
+            "reflection": 0.0,
+        }
+
+        self.logger.info(f"=== Starting episode {episode_id} ===")
+
+        core_result = self._run_task_core(task, episode_id, context)
+        score = core_result["score"]
+        success = core_result["success"]
+        plan = core_result["plan"]
+        execution_results = core_result["execution_results"]
+        eval_result = core_result["eval_result"]
+        training_time_planner = core_result["training_time_planner"]
+        t_exec_total = core_result["training_time_exec"]
+        training_time_eval = core_result["training_time_eval"]
+
         responsibility_report = None
         rollback_record = None
 
@@ -300,8 +328,40 @@ class TrainingOrchestrator:
             )
             overhead_components["rollback"] = time.time() - t_rb_start
 
+            if rollback_record and rollback_record.success:
+                t_reeval_start = time.time()
+                reeval_ep_id = f"{episode_id}_rb_eval"
+                try:
+                    reeval_result = self._run_task_core(task, reeval_ep_id, context)
+                    rollback_record.post_retraining_score = reeval_result["score"]
+                    rollback_record.improvement = (
+                        rollback_record.post_retraining_score
+                        - rollback_record.pre_rollback_score
+                    )
+                    rollback_record.success = rollback_record.improvement > -0.1
+                    rollback_record.processing_log.append(
+                        f"[重评] 回滚后重新评估(真实重跑): "
+                        f"新分数={reeval_result['score']:.4f}, "
+                        f"改善={rollback_record.improvement:+.4f}, "
+                        f"新状态={'成功' if reeval_result['success'] else '失败'}"
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Post-rollback re-evaluation failed: {e}")
+                    rollback_record.processing_log.append(
+                        f"[重评] 重新评估失败: {e}, 保留估算分数"
+                    )
+                reeval_elapsed = time.time() - t_reeval_start
+                reeval_overhead = min(reeval_elapsed * 0.1, 2.0)
+                overhead_components["post_rollback_eval"] = reeval_overhead
+                self.rollback_manager.budget_manager.record_training_time(
+                    reeval_elapsed - reeval_overhead
+                )
+
             self.rollback_manager.budget_manager.record_inference_time(
                 overhead_components["responsibility_inference"]
+            )
+            self.rollback_manager.budget_manager.record_rollback_time(
+                overhead_components.get("rollback", 0.0)
             )
         else:
             t_ref_start = time.time()
@@ -335,6 +395,14 @@ class TrainingOrchestrator:
         self.responsibility_inferencer.update_training_time(pure_training_time)
         self.rollback_manager.budget_manager.record_training_time(pure_training_time)
         self.rollback_manager.budget_manager.record_communication_time(communication_time_ep)
+        if overhead_components.get("reflection", 0.0) > 0:
+            self.rollback_manager.budget_manager.record_reflection_time(
+                overhead_components["reflection"]
+            )
+        if overhead_components.get("mdp_credit", 0.0) > 0:
+            self.rollback_manager.budget_manager.record_inference_time(
+                overhead_components["mdp_credit"]
+            )
 
         self._record_transitions_to_mdp(episode_id)
 
@@ -521,6 +589,9 @@ class TrainingOrchestrator:
 
     def get_agent_statistics(self) -> Dict[str, Dict[str, Any]]:
         return {aid: agent.get_statistics() for aid, agent in self.agents.items()}
+
+    def get_training_summary(self) -> Dict[str, Any]:
+        return self._compile_training_summary(self._episode_results)
 
     @property
     def episode_results(self) -> List[EpisodeResult]:

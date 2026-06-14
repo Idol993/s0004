@@ -95,7 +95,7 @@ def create_system(
     for role in ["planner", "executor", "evaluator", "memory", "reflector"]:
         agent_cfg = agents_cfg.get(role, {})
         llm_configs[role] = LLMConfig(
-            model_name=agent_cfg.get("model_name", "gpt2-medium"),
+            model_name=agent_cfg.get("model_name", "gpt2"),
             device=device,
             learning_rate=agent_cfg.get("learning_rate", 1e-5),
         )

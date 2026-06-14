@@ -100,7 +100,7 @@ class PlannerAgent(BaseAgent):
     def _parse_plan(self, plan_text: str) -> List[Dict[str, Any]]:
         lines = [l.strip() for l in plan_text.split("\n") if l.strip()]
         sub_tasks = []
-        max_subtasks = 3
+        max_subtasks = 1
         for i, line in enumerate(lines[:max_subtasks]):
             sub_tasks.append({
                 "id": f"subtask_{i}",
