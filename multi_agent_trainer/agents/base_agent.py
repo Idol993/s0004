@@ -48,7 +48,7 @@ class BaseAgent(ABC):
 
         self.logger = setup_logger(f"agent_{agent_id}", log_dir)
         from .llm_backbone import LLMBackbone
-        self.llm = LLMBackbone(llm_config, agent_id=agent_id, log_dir=log_dir)
+        self.llm = LLMBackbone(llm_config, agent_name=agent_id, log_dir=log_dir)
 
         self._action_history: List[ActionRecord] = []
         self._state_snapshots: Dict[int, Dict[str, Any]] = {}
